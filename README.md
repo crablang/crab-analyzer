@@ -4,7 +4,7 @@
     alt="crab-analyzer logo">
 </p> -->
 
-# crab-analyser
+# crab-analyzer
 
 crab-analyzer is a modular compiler frontend for the Crab language.
 
