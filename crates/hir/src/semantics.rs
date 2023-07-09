@@ -483,10 +483,6 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
         self.imp.scope_at_offset(node, offset)
     }
 
-    pub fn scope_for_def(&self, def: Trait) -> SemanticsScope<'db> {
-        self.imp.scope_for_def(def)
-    }
-
     pub fn assert_contains_node(&self, node: &SyntaxNode) {
         self.imp.assert_contains_node(node)
     }
@@ -1074,8 +1070,12 @@ impl<'db> SemanticsImpl<'db> {
     fn resolve_type(&self, ty: &ast::Type) -> Option<Type> {
         let analyze = self.analyze(ty.syntax())?;
         let ctx = LowerCtx::with_file_id(self.db.upcast(), analyze.file_id);
-        let ty = hir_ty::TyLoweringContext::new(self.db, &analyze.resolver)
-            .lower_ty(&crate::TypeRef::from_ast(&ctx, ty.clone()));
+        let ty = hir_ty::TyLoweringContext::new(
+            self.db,
+            &analyze.resolver,
+            analyze.resolver.module().into(),
+        )
+        .lower_ty(&crate::TypeRef::from_ast(&ctx, ty.clone()));
         Some(Type::new_with_resolver(self.db, &analyze.resolver, ty))
     }
 
@@ -1307,12 +1307,6 @@ impl<'db> SemanticsImpl<'db> {
         )
     }
 
-    fn scope_for_def(&self, def: Trait) -> SemanticsScope<'db> {
-        let file_id = self.db.lookup_intern_trait(def.id).id.file_id();
-        let resolver = def.id.resolver(self.db.upcast());
-        SemanticsScope { db: self.db, file_id, resolver }
-    }
-
     fn source<Def: HasSource>(&self, def: Def) -> Option<InFile<Def::Ast>>
     where
         Def::Ast: AstNode,
@@ -1500,7 +1494,11 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn is_inside_unsafe(&self, expr: &ast::Expr) -> bool {
-        let Some(enclosing_item) = expr.syntax().ancestors().find_map(Either::<ast::Item, ast::Variant>::cast) else { return false };
+        let Some(enclosing_item) =
+            expr.syntax().ancestors().find_map(Either::<ast::Item, ast::Variant>::cast)
+        else {
+            return false;
+        };
 
         let def = match &enclosing_item {
             Either::Left(ast::Item::Fn(it)) if it.unsafe_token().is_some() => return true,
@@ -1637,7 +1635,7 @@ pub struct SemanticsScope<'a> {
     resolver: Resolver,
 }
 
-impl<'a> SemanticsScope<'a> {
+impl SemanticsScope<'_> {
     pub fn module(&self) -> Module {
         Module { id: self.resolver.module() }
     }

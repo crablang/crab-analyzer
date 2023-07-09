@@ -181,7 +181,7 @@ impl AnalysisHost {
     }
 
     /// NB: this clears the database
-    pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes)> {
+    pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes, usize)> {
         self.db.per_query_memory_usage()
     }
     pub fn request_cancellation(&mut self) {
@@ -642,7 +642,7 @@ impl Analysis {
         };
 
         self.with_db(|db| {
-            let diagnostic_assists = if include_fixes {
+            let diagnostic_assists = if diagnostics_config.enabled && include_fixes {
                 ide_diagnostics::diagnostics(db, diagnostics_config, &resolve, frange.file_id)
                     .into_iter()
                     .flat_map(|it| it.fixes.unwrap_or_default())

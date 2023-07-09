@@ -14,9 +14,9 @@ use triomphe::Arc;
 use crate::{
     ast_id_map::AstIdMap, builtin_attr_macro::pseudo_derive_attr_expansion,
     builtin_fn_macro::EagerExpander, fixup, hygiene::HygieneFrame, tt, BuiltinAttrExpander,
-    BuiltinDeriveExpander, BuiltinFnLikeExpander, ExpandError, ExpandResult, ExpandTo, HirFileId,
-    HirFileIdRepr, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId, MacroDefKind, MacroFile,
-    ProcMacroExpander,
+    BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerCallInfo, ExpandError, ExpandResult,
+    ExpandTo, HirFileId, HirFileIdRepr, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId,
+    MacroDefKind, MacroFile, ProcMacroExpander,
 };
 
 /// Total limit on the number of tokens produced by any macro invocation.
@@ -53,16 +53,11 @@ impl TokenExpander {
         match self {
             TokenExpander::DeclarativeMacro { mac, .. } => mac.expand(tt).map_err(Into::into),
             TokenExpander::Builtin(it) => it.expand(db, id, tt).map_err(Into::into),
-            TokenExpander::BuiltinEager(it) => {
-                it.expand(db, id, tt).map_err(Into::into).map(|res| res.subtree)
-            }
+            TokenExpander::BuiltinEager(it) => it.expand(db, id, tt).map_err(Into::into),
             TokenExpander::BuiltinAttr(it) => it.expand(db, id, tt),
             TokenExpander::BuiltinDerive(it) => it.expand(db, id, tt),
             TokenExpander::ProcMacro(_) => {
-                // We store the result in salsa db to prevent non-deterministic behavior in
-                // some proc-macro implementation
-                // See #4315 for details
-                db.expand_proc_macro(id)
+                unreachable!("ExpandDatabase::expand_proc_macro should be used for proc macros")
             }
         }
     }
@@ -132,11 +127,19 @@ pub trait ExpandDatabase: SourceDatabase {
     /// Expand macro call to a token tree.
     // This query is LRU cached
     fn macro_expand(&self, macro_call: MacroCallId) -> ExpandResult<Arc<tt::Subtree>>;
+    #[salsa::invoke(crate::builtin_fn_macro::include_arg_to_tt)]
+    fn include_expand(
+        &self,
+        arg_id: MacroCallId,
+    ) -> Result<
+        (triomphe::Arc<(::tt::Subtree<::tt::TokenId>, mbe::TokenMap)>, base_db::FileId),
+        ExpandError,
+    >;
     /// Special case of the previous query for procedural macros. We can't LRU
     /// proc macros, since they are not deterministic in general, and
     /// non-determinism breaks salsa in a very, very, very bad way.
-    /// @edwin0cheng heroically debugged this once!
-    fn expand_proc_macro(&self, call: MacroCallId) -> ExpandResult<tt::Subtree>;
+    /// @edwin0cheng heroically debugged this once! See #4315 for details
+    fn expand_proc_macro(&self, call: MacroCallId) -> ExpandResult<Arc<tt::Subtree>>;
     /// Firewall query that returns the errors from the `parse_macro_expansion` query.
     fn parse_macro_expansion_error(
         &self,
@@ -281,31 +284,6 @@ fn parse_macro_expansion(
     let _p = profile::span("parse_macro_expansion");
     let mbe::ValueResult { value: tt, err } = db.macro_expand(macro_file.macro_call_id);
 
-    if let Some(err) = &err {
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            // Note:
-            // The final goal we would like to make all parse_macro success,
-            // such that the following log will not call anyway.
-            let loc = db.lookup_intern_macro_call(macro_file.macro_call_id);
-            let node = loc.to_node(db);
-
-            // collect parent information for warning log
-            let parents = std::iter::successors(loc.kind.file_id().call_node(db), |it| {
-                it.file_id.call_node(db)
-            })
-            .map(|n| format!("{:#}", n.value))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-            tracing::debug!(
-                "fail on macro_parse: (reason: {:?} macro_call: {:#}) parents: {}",
-                err,
-                node.value,
-                parents
-            );
-        }
-    }
-
     let expand_to = macro_expand_to(db, macro_file.macro_call_id);
 
     tracing::debug!("expanded = {}", tt.as_debug_string());
@@ -316,12 +294,25 @@ fn parse_macro_expansion(
     ExpandResult { value: (parse, Arc::new(rev_token_map)), err }
 }
 
+fn parse_macro_expansion_error(
+    db: &dyn ExpandDatabase,
+    macro_call_id: MacroCallId,
+) -> ExpandResult<Box<[SyntaxError]>> {
+    db.parse_macro_expansion(MacroFile { macro_call_id })
+        .map(|it| it.0.errors().to_vec().into_boxed_slice())
+}
+
 fn macro_arg(
     db: &dyn ExpandDatabase,
     id: MacroCallId,
 ) -> Option<Arc<(tt::Subtree, mbe::TokenMap, fixup::SyntaxFixupUndoInfo)>> {
-    let arg = db.macro_arg_text(id)?;
     let loc = db.lookup_intern_macro_call(id);
+
+    if let Some(EagerCallInfo { arg, arg_id: Some(_), error: _ }) = loc.eager.as_deref() {
+        return Some(Arc::new((arg.0.clone(), arg.1.clone(), Default::default())));
+    }
+
+    let arg = db.macro_arg_text(id)?;
 
     let node = SyntaxNode::new_root(arg);
     let censor = censor_for_macro_input(&loc, &node);
@@ -398,7 +389,17 @@ fn macro_arg_text(db: &dyn ExpandDatabase, id: MacroCallId) -> Option<GreenNode>
             return None;
         }
     }
-    Some(arg.green().into())
+    if let Some(EagerCallInfo { arg, .. }) = loc.eager.as_deref() {
+        Some(
+            mbe::token_tree_to_syntax_node(&arg.0, mbe::TopEntryPoint::Expr)
+                .0
+                .syntax_node()
+                .green()
+                .into(),
+        )
+    } else {
+        Some(arg.green().into())
+    }
 }
 
 fn macro_def(
@@ -445,87 +446,70 @@ fn macro_def(
 fn macro_expand(db: &dyn ExpandDatabase, id: MacroCallId) -> ExpandResult<Arc<tt::Subtree>> {
     let _p = profile::span("macro_expand");
     let loc = db.lookup_intern_macro_call(id);
-    if let Some(eager) = &loc.eager {
-        return ExpandResult { value: eager.arg_or_expansion.clone(), err: eager.error.clone() };
+    if let Some(EagerCallInfo { arg, arg_id: None, error }) = loc.eager.as_deref() {
+        // This is an input expansion for an eager macro. These are already pre-expanded
+        return ExpandResult { value: Arc::new(arg.0.clone()), err: error.clone() };
+    }
+
+    if let MacroDefKind::ProcMacro(..) = loc.def.kind {
+        return db.expand_proc_macro(id);
     }
 
     let expander = match db.macro_def(loc.def) {
         Ok(it) => it,
-        // FIXME: This is weird -- we effectively report macro *definition*
-        // errors lazily, when we try to expand the macro. Instead, they should
-        // be reported at the definition site when we construct a def map.
-        // (Note we do report them also at the definition site in the late diagnostic pass)
+        // FIXME: We should make sure to enforce a variant that invalid macro
+        // definitions do not get expanders that could reach this call path!
         Err(err) => {
             return ExpandResult {
                 value: Arc::new(tt::Subtree {
                     delimiter: tt::Delimiter::UNSPECIFIED,
                     token_trees: vec![],
                 }),
-                err: Some(ExpandError::Other(format!("invalid macro definition: {err}").into())),
+                err: Some(ExpandError::other(format!("invalid macro definition: {err}"))),
             }
         }
     };
     let Some(macro_arg) = db.macro_arg(id) else {
         return ExpandResult {
-            value: Arc::new(
-                tt::Subtree {
-                    delimiter: tt::Delimiter::UNSPECIFIED,
-                    token_trees: Vec::new(),
-                },
-            ),
-            err: Some(ExpandError::Other(
-                "invalid token tree"
-                .into(),
-            )),
-        };
-    };
-    let ExpandResult { value: mut tt, err } = expander.expand(db, id, &macro_arg.0);
-    // Set a hard limit for the expanded tt
-    let count = tt.count();
-    if TOKEN_LIMIT.check(count).is_err() {
-        return ExpandResult {
             value: Arc::new(tt::Subtree {
                 delimiter: tt::Delimiter::UNSPECIFIED,
-                token_trees: vec![],
+                token_trees: Vec::new(),
             }),
-            err: Some(ExpandError::Other(
-                format!(
-                    "macro invocation exceeds token limit: produced {} tokens, limit is {}",
-                    count,
-                    TOKEN_LIMIT.inner(),
-                )
-                .into(),
-            )),
+            // FIXME: We should make sure to enforce an invariant that invalid macro
+            // calls do not reach this call path!
+            err: Some(ExpandError::other("invalid token tree")),
         };
+    };
+    let (arg_tt, arg_tm, undo_info) = &*macro_arg;
+    let ExpandResult { value: mut tt, mut err } = expander.expand(db, id, arg_tt);
+
+    if let Some(EagerCallInfo { error, .. }) = loc.eager.as_deref() {
+        // FIXME: We should report both errors!
+        err = error.clone().or(err);
     }
 
-    fixup::reverse_fixups(&mut tt, &macro_arg.1, &macro_arg.2);
+    // Set a hard limit for the expanded tt
+    if let Err(value) = check_tt_count(&tt) {
+        return value;
+    }
+
+    fixup::reverse_fixups(&mut tt, arg_tm, undo_info);
 
     ExpandResult { value: Arc::new(tt), err }
 }
 
-fn parse_macro_expansion_error(
-    db: &dyn ExpandDatabase,
-    macro_call_id: MacroCallId,
-) -> ExpandResult<Box<[SyntaxError]>> {
-    db.parse_macro_expansion(MacroFile { macro_call_id })
-        .map(|it| it.0.errors().to_vec().into_boxed_slice())
-}
-
-fn expand_proc_macro(db: &dyn ExpandDatabase, id: MacroCallId) -> ExpandResult<tt::Subtree> {
+fn expand_proc_macro(db: &dyn ExpandDatabase, id: MacroCallId) -> ExpandResult<Arc<tt::Subtree>> {
     let loc = db.lookup_intern_macro_call(id);
     let Some(macro_arg) = db.macro_arg(id) else {
         return ExpandResult {
-            value: tt::Subtree {
+            value: Arc::new(tt::Subtree {
                 delimiter: tt::Delimiter::UNSPECIFIED,
                 token_trees: Vec::new(),
-            },
-            err: Some(ExpandError::Other(
-                "invalid token tree"
-                .into(),
-            )),
+            }),
+            err: Some(ExpandError::other("invalid token tree")),
         };
     };
+    let (arg_tt, arg_tm, undo_info) = &*macro_arg;
 
     let expander = match loc.def.kind {
         MacroDefKind::ProcMacro(expander, ..) => expander,
@@ -535,13 +519,23 @@ fn expand_proc_macro(db: &dyn ExpandDatabase, id: MacroCallId) -> ExpandResult<t
     let attr_arg = match &loc.kind {
         MacroCallKind::Attr { attr_args, .. } => {
             let mut attr_args = attr_args.0.clone();
-            mbe::Shift::new(&macro_arg.0).shift_all(&mut attr_args);
+            mbe::Shift::new(arg_tt).shift_all(&mut attr_args);
             Some(attr_args)
         }
         _ => None,
     };
 
-    expander.expand(db, loc.def.krate, loc.krate, &macro_arg.0, attr_arg.as_ref())
+    let ExpandResult { value: mut tt, err } =
+        expander.expand(db, loc.def.krate, loc.krate, arg_tt, attr_arg.as_ref());
+
+    // Set a hard limit for the expanded tt
+    if let Err(value) = check_tt_count(&tt) {
+        return value;
+    }
+
+    fixup::reverse_fixups(&mut tt, arg_tm, undo_info);
+
+    ExpandResult { value: Arc::new(tt), err }
 }
 
 fn hygiene_frame(db: &dyn ExpandDatabase, file_id: HirFileId) -> Arc<HygieneFrame> {
@@ -564,4 +558,23 @@ fn token_tree_to_syntax_node(
         ExpandTo::Expr => mbe::TopEntryPoint::Expr,
     };
     mbe::token_tree_to_syntax_node(tt, entry_point)
+}
+
+fn check_tt_count(tt: &tt::Subtree) -> Result<(), ExpandResult<Arc<tt::Subtree>>> {
+    let count = tt.count();
+    if TOKEN_LIMIT.check(count).is_err() {
+        Err(ExpandResult {
+            value: Arc::new(tt::Subtree {
+                delimiter: tt::Delimiter::UNSPECIFIED,
+                token_trees: vec![],
+            }),
+            err: Some(ExpandError::other(format!(
+                "macro invocation exceeds token limit: produced {} tokens, limit is {}",
+                count,
+                TOKEN_LIMIT.inner(),
+            ))),
+        })
+    } else {
+        Ok(())
+    }
 }

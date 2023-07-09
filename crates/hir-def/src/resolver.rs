@@ -21,11 +21,11 @@ use crate::{
     path::{ModPath, Path, PathKind},
     per_ns::PerNs,
     visibility::{RawVisibility, Visibility},
-    AdtId, AssocItemId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternBlockId,
-    FunctionId, GenericDefId, GenericParamId, HasModule, ImplId, ItemContainerId, LifetimeParamId,
-    LocalModuleId, Lookup, Macro2Id, MacroId, MacroRulesId, ModuleDefId, ModuleId, ProcMacroId,
-    StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId,
-    VariantId,
+    AdtId, AssocItemId, ConstId, ConstParamId, CrateRootModuleId, DefWithBodyId, EnumId,
+    EnumVariantId, ExternBlockId, ExternCrateId, FunctionId, GenericDefId, GenericParamId,
+    HasModule, ImplId, ItemContainerId, LifetimeParamId, LocalModuleId, Lookup, Macro2Id, MacroId,
+    MacroRulesId, ModuleDefId, ModuleId, ProcMacroId, StaticId, StructId, TraitAliasId, TraitId,
+    TypeAliasId, TypeOrConstParamId, TypeOwnerId, TypeParamId, VariantId,
 };
 
 #[derive(Debug, Clone)]
@@ -186,12 +186,12 @@ impl Resolver {
             Path::LangItem(l) => {
                 return Some((
                     match *l {
-                        LangItemTarget::Union(x) => TypeNs::AdtId(x.into()),
-                        LangItemTarget::TypeAlias(x) => TypeNs::TypeAliasId(x),
-                        LangItemTarget::Struct(x) => TypeNs::AdtId(x.into()),
-                        LangItemTarget::EnumVariant(x) => TypeNs::EnumVariantId(x),
-                        LangItemTarget::EnumId(x) => TypeNs::AdtId(x.into()),
-                        LangItemTarget::Trait(x) => TypeNs::TraitId(x),
+                        LangItemTarget::Union(it) => TypeNs::AdtId(it.into()),
+                        LangItemTarget::TypeAlias(it) => TypeNs::TypeAliasId(it),
+                        LangItemTarget::Struct(it) => TypeNs::AdtId(it.into()),
+                        LangItemTarget::EnumVariant(it) => TypeNs::EnumVariantId(it),
+                        LangItemTarget::EnumId(it) => TypeNs::AdtId(it.into()),
+                        LangItemTarget::Trait(it) => TypeNs::TraitId(it),
                         LangItemTarget::Function(_)
                         | LangItemTarget::ImplDef(_)
                         | LangItemTarget::Static(_) => return None,
@@ -273,10 +273,10 @@ impl Resolver {
             Path::Normal { mod_path, .. } => mod_path,
             Path::LangItem(l) => {
                 return Some(ResolveValueResult::ValueNs(match *l {
-                    LangItemTarget::Function(x) => ValueNs::FunctionId(x),
-                    LangItemTarget::Static(x) => ValueNs::StaticId(x),
-                    LangItemTarget::Struct(x) => ValueNs::StructId(x),
-                    LangItemTarget::EnumVariant(x) => ValueNs::EnumVariantId(x),
+                    LangItemTarget::Function(it) => ValueNs::FunctionId(it),
+                    LangItemTarget::Static(it) => ValueNs::StaticId(it),
+                    LangItemTarget::Struct(it) => ValueNs::StructId(it),
+                    LangItemTarget::EnumVariant(it) => ValueNs::EnumVariantId(it),
                     LangItemTarget::Union(_)
                     | LangItemTarget::ImplDef(_)
                     | LangItemTarget::TypeAlias(_)
@@ -425,14 +425,14 @@ impl Resolver {
     /// The shadowing is accounted for: in
     ///
     /// ```
-    /// let x = 92;
+    /// let it = 92;
     /// {
-    ///     let x = 92;
+    ///     let it = 92;
     ///     $0
     /// }
     /// ```
     ///
-    /// there will be only one entry for `x` in the result.
+    /// there will be only one entry for `it` in the result.
     ///
     /// The result is ordered *roughly* from the innermost scope to the
     /// outermost: when the name is introduced in two namespaces in two scopes,
@@ -946,6 +946,15 @@ impl HasResolver for ModuleId {
     }
 }
 
+impl HasResolver for CrateRootModuleId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        Resolver {
+            scopes: vec![],
+            module_scope: ModuleItemMap { def_map: self.def_map(db), module_id: DefMap::ROOT },
+        }
+    }
+}
+
 impl HasResolver for TraitId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         self.lookup(db).container.resolver(db).push_generic_params_scope(db, self.into())
@@ -1009,6 +1018,30 @@ impl HasResolver for ExternBlockId {
     }
 }
 
+impl HasResolver for ExternCrateId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        self.lookup(db).container.resolver(db)
+    }
+}
+
+impl HasResolver for TypeOwnerId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        match self {
+            TypeOwnerId::FunctionId(it) => it.resolver(db),
+            TypeOwnerId::StaticId(it) => it.resolver(db),
+            TypeOwnerId::ConstId(it) => it.resolver(db),
+            TypeOwnerId::InTypeConstId(it) => it.lookup(db).owner.resolver(db),
+            TypeOwnerId::AdtId(it) => it.resolver(db),
+            TypeOwnerId::TraitId(it) => it.resolver(db),
+            TypeOwnerId::TraitAliasId(it) => it.resolver(db),
+            TypeOwnerId::TypeAliasId(it) => it.resolver(db),
+            TypeOwnerId::ImplId(it) => it.resolver(db),
+            TypeOwnerId::EnumVariantId(it) => it.resolver(db),
+            TypeOwnerId::ModuleId(it) => it.resolver(db),
+        }
+    }
+}
+
 impl HasResolver for DefWithBodyId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         match self {
@@ -1016,6 +1049,7 @@ impl HasResolver for DefWithBodyId {
             DefWithBodyId::FunctionId(f) => f.resolver(db),
             DefWithBodyId::StaticId(s) => s.resolver(db),
             DefWithBodyId::VariantId(v) => v.parent.resolver(db),
+            DefWithBodyId::InTypeConstId(c) => c.lookup(db).owner.resolver(db),
         }
     }
 }

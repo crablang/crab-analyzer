@@ -38,8 +38,8 @@ use hir_ty::{
         UnsafeExpr,
     },
     lang_items::lang_items_for_bin_op,
-    method_resolution::{self},
-    Adjustment, InferenceResult, Interner, Substitution, Ty, TyExt, TyKind, TyLoweringContext,
+    method_resolution, Adjustment, InferenceResult, Interner, Substitution, Ty, TyExt, TyKind,
+    TyLoweringContext,
 };
 use itertools::Itertools;
 use smallvec::SmallVec;
@@ -832,7 +832,7 @@ impl SourceAnalyzer {
             None => return func,
         };
         let env = db.trait_environment_for_body(owner);
-        method_resolution::lookup_impl_method(db, env, func, substs).0
+        db.lookup_impl_method(env, func, substs).0
     }
 
     fn resolve_impl_const_or_trait_def(
@@ -978,7 +978,8 @@ fn resolve_hir_path_(
     let types = || {
         let (ty, unresolved) = match path.type_anchor() {
             Some(type_ref) => {
-                let (_, res) = TyLoweringContext::new(db, resolver).lower_ty_ext(type_ref);
+                let (_, res) = TyLoweringContext::new(db, resolver, resolver.module().into())
+                    .lower_ty_ext(type_ref);
                 res.map(|ty_ns| (ty_ns, path.segments().first()))
             }
             None => {

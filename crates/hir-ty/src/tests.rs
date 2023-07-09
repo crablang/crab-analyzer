@@ -30,7 +30,7 @@ use syntax::{
     ast::{self, AstNode, HasName},
     SyntaxNode,
 };
-use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+use tracing_subscriber::{layer::SubscriberExt, Registry};
 use tracing_tree::HierarchicalLayer;
 use triomphe::Arc;
 
@@ -52,7 +52,8 @@ fn setup_tracing() -> Option<tracing::subscriber::DefaultGuard> {
         return None;
     }
 
-    let filter = EnvFilter::from_env("CHALK_DEBUG");
+    let filter: tracing_subscriber::filter::Targets =
+        env::var("CHALK_DEBUG").ok().and_then(|it| it.parse().ok()).unwrap_or_default();
     let layer = HierarchicalLayer::default()
         .with_indent_lines(true)
         .with_ansi(false)
@@ -146,6 +147,7 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
             let loc = db.lookup_intern_enum(it.parent);
             loc.source(&db).value.syntax().text_range().start()
         }
+        DefWithBodyId::InTypeConstId(it) => it.source(&db).syntax().text_range().start(),
     });
     let mut unexpected_type_mismatches = String::new();
     for def in defs {
@@ -204,7 +206,9 @@ fn check_impl(ra_fixture: &str, allow_none: bool, only_types: bool, display_sour
             let Some(node) = (match expr_or_pat {
                 hir_def::hir::ExprOrPatId::ExprId(expr) => expr_node(&body_source_map, expr, &db),
                 hir_def::hir::ExprOrPatId::PatId(pat) => pat_node(&body_source_map, pat, &db),
-            }) else { continue; };
+            }) else {
+                continue;
+            };
             let range = node.as_ref().original_file_range(&db);
             let actual = format!(
                 "expected {}, got {}",
@@ -391,6 +395,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
             let loc = db.lookup_intern_enum(it.parent);
             loc.source(&db).value.syntax().text_range().start()
         }
+        DefWithBodyId::InTypeConstId(it) => it.source(&db).syntax().text_range().start(),
     });
     for def in defs {
         let (body, source_map) = db.body_with_source_map(def);

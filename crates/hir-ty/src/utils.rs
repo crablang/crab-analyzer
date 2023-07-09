@@ -1,7 +1,7 @@
 //! Helper functions for working with def, which don't need to be a separate
 //! query, but can't be computed directly from `*Data` (ie, which need a `db`).
 
-use std::iter;
+use std::{hash::Hash, iter};
 
 use base_db::CrateId;
 use chalk_ir::{
@@ -20,7 +20,8 @@ use hir_def::{
     resolver::{HasResolver, TypeNs},
     type_ref::{TraitBoundModifier, TypeRef},
     ConstParamId, EnumId, EnumVariantId, FunctionId, GenericDefId, ItemContainerId,
-    LocalEnumVariantId, Lookup, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId,
+    LocalEnumVariantId, Lookup, OpaqueInternableThing, TraitId, TypeAliasId, TypeOrConstParamId,
+    TypeParamId,
 };
 use hir_expand::name::Name;
 use intern::Interned;
@@ -88,7 +89,7 @@ struct SuperTraits<'a> {
     seen: FxHashSet<ChalkTraitId>,
 }
 
-impl<'a> SuperTraits<'a> {
+impl SuperTraits<'_> {
     fn elaborate(&mut self, trait_ref: &TraitRef) {
         direct_super_trait_refs(self.db, trait_ref, |trait_ref| {
             if !self.seen.contains(&trait_ref.trait_id) {
@@ -98,7 +99,7 @@ impl<'a> SuperTraits<'a> {
     }
 }
 
-impl<'a> Iterator for SuperTraits<'a> {
+impl Iterator for SuperTraits<'_> {
     type Item = TraitRef;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -463,4 +464,29 @@ pub(crate) fn detect_variant_from_bytes<'a>(
         }
     };
     Some((var_id, var_layout))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct InTypeConstIdMetadata(pub(crate) Ty);
+
+impl OpaqueInternableThing for InTypeConstIdMetadata {
+    fn dyn_hash(&self, mut state: &mut dyn std::hash::Hasher) {
+        self.hash(&mut state);
+    }
+
+    fn dyn_eq(&self, other: &dyn OpaqueInternableThing) -> bool {
+        other.as_any().downcast_ref::<Self>().map_or(false, |x| self == x)
+    }
+
+    fn dyn_clone(&self) -> Box<dyn OpaqueInternableThing> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn box_any(&self) -> Box<dyn std::any::Any> {
+        Box::new(self.clone())
+    }
 }

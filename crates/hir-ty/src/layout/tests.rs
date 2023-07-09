@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use base_db::fixture::WithFixture;
 use chalk_ir::{AdtId, TyKind};
+use either::Either;
 use hir_def::db::DefDatabase;
 use triomphe::Arc;
 
@@ -25,27 +26,38 @@ fn eval_goal(ra_fixture: &str, minicore: &str) -> Result<Arc<Layout>, LayoutErro
     );
 
     let (db, file_ids) = TestDB::with_many_files(&ra_fixture);
-    let (adt_id, module_id) = file_ids
+    let (adt_or_type_alias_id, module_id) = file_ids
         .into_iter()
         .find_map(|file_id| {
             let module_id = db.module_for_file(file_id);
             let def_map = module_id.def_map(&db);
             let scope = &def_map[module_id.local_id].scope;
-            let adt_id = scope.declarations().find_map(|x| match x {
+            let adt_or_type_alias_id = scope.declarations().find_map(|x| match x {
                 hir_def::ModuleDefId::AdtId(x) => {
                     let name = match x {
                         hir_def::AdtId::StructId(x) => db.struct_data(x).name.to_smol_str(),
                         hir_def::AdtId::UnionId(x) => db.union_data(x).name.to_smol_str(),
                         hir_def::AdtId::EnumId(x) => db.enum_data(x).name.to_smol_str(),
                     };
-                    (name == "Goal").then_some(x)
+                    (name == "Goal").then_some(Either::Left(x))
+                }
+                hir_def::ModuleDefId::TypeAliasId(x) => {
+                    let name = db.type_alias_data(x).name.to_smol_str();
+                    (name == "Goal").then_some(Either::Right(x))
                 }
                 _ => None,
             })?;
-            Some((adt_id, module_id))
+            Some((adt_or_type_alias_id, module_id))
         })
         .unwrap();
-    let goal_ty = TyKind::Adt(AdtId(adt_id), Substitution::empty(Interner)).intern(Interner);
+    let goal_ty = match adt_or_type_alias_id {
+        Either::Left(adt_id) => {
+            TyKind::Adt(AdtId(adt_id), Substitution::empty(Interner)).intern(Interner)
+        }
+        Either::Right(ty_id) => {
+            db.ty(ty_id.into()).substitute(Interner, &Substitution::empty(Interner))
+        }
+    };
     db.layout_of_ty(goal_ty, module_id.krate())
 }
 
@@ -259,6 +271,20 @@ struct Goal(Foo<S>);
 }
 
 #[test]
+fn simd_types() {
+    check_size_and_align(
+        r#"
+            #[repr(simd)]
+            struct SimdType(i64, i64);
+            struct Goal(SimdType);
+        "#,
+        "",
+        16,
+        16,
+    );
+}
+
+#[test]
 fn return_position_impl_trait() {
     size_and_align_expr! {
         trait T {}
@@ -332,6 +358,24 @@ fn return_position_impl_trait() {
 }
 
 #[test]
+fn unsized_ref() {
+    size_and_align! {
+        struct S1([u8]);
+        struct S2(S1);
+        struct S3(i32, str);
+        struct S4(u64, S3);
+        #[allow(dead_code)]
+        struct S5 {
+            field1: u8,
+            field2: i16,
+            field_last: S4,
+        }
+
+        struct Goal(&'static S1, &'static S2, &'static S3, &'static S4, &'static S5);
+    }
+}
+
+#[test]
 fn enums() {
     size_and_align! {
         enum Goal {
@@ -357,11 +401,11 @@ fn tuple() {
 }
 
 #[test]
-fn non_zero() {
+fn non_zero_and_non_null() {
     size_and_align! {
-        minicore: non_zero, option;
-        use core::num::NonZeroU8;
-        struct Goal(Option<NonZeroU8>);
+        minicore: non_zero, non_null, option;
+        use core::{num::NonZeroU8, ptr::NonNull};
+        struct Goal(Option<NonZeroU8>, Option<NonNull<i32>>);
     }
 }
 
@@ -380,8 +424,21 @@ fn niche_optimization() {
 #[test]
 fn const_eval() {
     size_and_align! {
+        struct Goal([i32; 2 + 2]);
+    }
+    size_and_align! {
         const X: usize = 5;
         struct Goal([i32; X]);
+    }
+    size_and_align! {
+        mod foo {
+            pub(super) const BAR: usize = 5;
+        }
+        struct Ar<T>([T; foo::BAR]);
+        struct Goal(Ar<Ar<i32>>);
+    }
+    size_and_align! {
+        type Goal = [u8; 2 + 2];
     }
 }
 

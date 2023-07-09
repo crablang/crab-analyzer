@@ -46,7 +46,7 @@ use ast::{AstNode, HasName, StructKind};
 use base_db::CrateId;
 use either::Either;
 use hir_expand::{
-    ast_id_map::FileAstId,
+    ast_id_map::{AstIdNode, FileAstId},
     attrs::RawAttrs,
     hygiene::Hygiene,
     name::{name, AsName, Name},
@@ -101,7 +101,6 @@ pub struct ItemTree {
     top_level: SmallVec<[ModItem; 1]>,
     attrs: FxHashMap<AttrOwner, RawAttrs>,
 
-    // FIXME: Remove this indirection, an item tree is almost always non-empty?
     data: Option<Box<ItemTreeData>>,
 }
 
@@ -315,7 +314,7 @@ from_attrs!(ModItem(ModItem), Variant(Idx<Variant>), Field(Idx<Field>), Param(Id
 
 /// Trait implemented by all item nodes in the item tree.
 pub trait ItemTreeNode: Clone {
-    type Source: AstNode + Into<ast::Item>;
+    type Source: AstIdNode + Into<ast::Item>;
 
     fn ast_id(&self) -> FileAstId<Self::Source>;
 
@@ -718,7 +717,6 @@ pub struct Mod {
 pub enum ModKind {
     /// `mod m { ... }`
     Inline { items: Box<[ModItem]> },
-
     /// `mod m;`
     Outline,
 }
@@ -890,10 +888,6 @@ impl ModItem {
             ModItem::TypeAlias(alias) => Some(AssocItem::TypeAlias(*alias)),
             ModItem::Function(func) => Some(AssocItem::Function(*func)),
         }
-    }
-
-    pub fn downcast<N: ItemTreeNode>(self) -> Option<FileItemTreeId<N>> {
-        N::id_from_mod_item(self)
     }
 
     pub fn ast_id(&self, tree: &ItemTree) -> FileAstId<ast::Item> {

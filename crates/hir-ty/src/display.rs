@@ -2,7 +2,10 @@
 //! HIR back into source code, and just displaying them for debugging/testing
 //! purposes.
 
-use std::fmt::{self, Debug};
+use std::{
+    fmt::{self, Debug},
+    mem::size_of,
+};
 
 use base_db::CrateId;
 use chalk_ir::{BoundVar, TyKind};
@@ -189,7 +192,7 @@ pub trait HirDisplay {
     }
 }
 
-impl<'a> HirFormatter<'a> {
+impl HirFormatter<'_> {
     pub fn write_joined<T: HirDisplay>(
         &mut self,
         iter: impl IntoIterator<Item = T>,
@@ -339,7 +342,7 @@ impl<T: HirDisplay> HirDisplayWrapper<'_, T> {
     }
 }
 
-impl<'a, T> fmt::Display for HirDisplayWrapper<'a, T>
+impl<T> fmt::Display for HirDisplayWrapper<'_, T>
 where
     T: HirDisplay,
 {
@@ -357,7 +360,7 @@ where
 
 const TYPE_HINT_TRUNCATION: &str = "…";
 
-impl<T: HirDisplay> HirDisplay for &'_ T {
+impl<T: HirDisplay> HirDisplay for &T {
     fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
         HirDisplay::hir_fmt(*self, f)
     }
@@ -443,28 +446,6 @@ impl HirDisplay for Const {
     }
 }
 
-pub struct HexifiedConst(pub Const);
-
-impl HirDisplay for HexifiedConst {
-    fn hir_fmt(&self, f: &mut HirFormatter<'_>) -> Result<(), HirDisplayError> {
-        let data = &self.0.data(Interner);
-        if let TyKind::Scalar(s) = data.ty.kind(Interner) {
-            if matches!(s, Scalar::Int(_) | Scalar::Uint(_)) {
-                if let ConstValue::Concrete(c) = &data.value {
-                    if let ConstScalar::Bytes(b, m) = &c.interned {
-                        let value = u128::from_le_bytes(pad16(b, false));
-                        if value >= 10 {
-                            render_const_scalar(f, &b, m, &data.ty)?;
-                            return write!(f, " ({:#X})", value);
-                        }
-                    }
-                }
-            }
-        }
-        self.0.hir_fmt(f)
-    }
-}
-
 fn render_const_scalar(
     f: &mut HirFormatter<'_>,
     b: &[u8],
@@ -478,28 +459,28 @@ fn render_const_scalar(
         TyKind::Scalar(s) => match s {
             Scalar::Bool => write!(f, "{}", if b[0] == 0 { false } else { true }),
             Scalar::Char => {
-                let x = u128::from_le_bytes(pad16(b, false)) as u32;
-                let Ok(c) = char::try_from(x) else {
+                let it = u128::from_le_bytes(pad16(b, false)) as u32;
+                let Ok(c) = char::try_from(it) else {
                     return f.write_str("<unicode-error>");
                 };
                 write!(f, "{c:?}")
             }
             Scalar::Int(_) => {
-                let x = i128::from_le_bytes(pad16(b, true));
-                write!(f, "{x}")
+                let it = i128::from_le_bytes(pad16(b, true));
+                write!(f, "{it}")
             }
             Scalar::Uint(_) => {
-                let x = u128::from_le_bytes(pad16(b, false));
-                write!(f, "{x}")
+                let it = u128::from_le_bytes(pad16(b, false));
+                write!(f, "{it}")
             }
             Scalar::Float(fl) => match fl {
                 chalk_ir::FloatTy::F32 => {
-                    let x = f32::from_le_bytes(b.try_into().unwrap());
-                    write!(f, "{x:?}")
+                    let it = f32::from_le_bytes(b.try_into().unwrap());
+                    write!(f, "{it:?}")
                 }
                 chalk_ir::FloatTy::F64 => {
-                    let x = f64::from_le_bytes(b.try_into().unwrap());
-                    write!(f, "{x:?}")
+                    let it = f64::from_le_bytes(b.try_into().unwrap());
+                    write!(f, "{it:?}")
                 }
             },
         },
@@ -536,8 +517,44 @@ fn render_const_scalar(
                 }
                 f.write_str("]")
             }
+            TyKind::Dyn(_) => {
+                let addr = usize::from_le_bytes(b[0..b.len() / 2].try_into().unwrap());
+                let ty_id = usize::from_le_bytes(b[b.len() / 2..].try_into().unwrap());
+                let Ok(t) = memory_map.vtable.ty(ty_id) else {
+                    return f.write_str("<ty-missing-in-vtable-map>");
+                };
+                let Ok(layout) = f.db.layout_of_ty(t.clone(), krate) else {
+                    return f.write_str("<layout-error>");
+                };
+                let size = layout.size.bytes_usize();
+                let Some(bytes) = memory_map.get(addr, size) else {
+                    return f.write_str("<ref-data-not-available>");
+                };
+                f.write_str("&")?;
+                render_const_scalar(f, bytes, memory_map, t)
+            }
+            TyKind::Adt(adt, _) if b.len() == 2 * size_of::<usize>() => match adt.0 {
+                hir_def::AdtId::StructId(s) => {
+                    let data = f.db.struct_data(s);
+                    write!(f, "&{}", data.name.display(f.db.upcast()))?;
+                    Ok(())
+                }
+                _ => {
+                    return f.write_str("<unsized-enum-or-union>");
+                }
+            },
             _ => {
-                let addr = usize::from_le_bytes(b.try_into().unwrap());
+                let addr = usize::from_le_bytes(match b.try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        never!(
+                            "tried rendering ty {:?} in const ref with incorrect byte count {}",
+                            t,
+                            b.len()
+                        );
+                        return f.write_str("<layout-error>");
+                    }
+                });
                 let Ok(layout) = f.db.layout_of_ty(t.clone(), krate) else {
                     return f.write_str("<layout-error>");
                 };
@@ -597,7 +614,8 @@ fn render_const_scalar(
                 }
                 hir_def::AdtId::EnumId(e) => {
                     let Some((var_id, var_layout)) =
-                            detect_variant_from_bytes(&layout, f.db, krate, b, e) else {
+                        detect_variant_from_bytes(&layout, f.db, krate, b, e)
+                    else {
                         return f.write_str("<failed-to-detect-variant>");
                     };
                     let data = &f.db.enum_data(e).variants[var_id];
@@ -619,8 +637,8 @@ fn render_const_scalar(
         }
         TyKind::FnDef(..) => ty.hir_fmt(f),
         TyKind::Function(_) | TyKind::Raw(_, _) => {
-            let x = u128::from_le_bytes(pad16(b, false));
-            write!(f, "{:#X} as ", x)?;
+            let it = u128::from_le_bytes(pad16(b, false));
+            write!(f, "{:#X} as ", it)?;
             ty.hir_fmt(f)
         }
         TyKind::Array(ty, len) => {
@@ -696,7 +714,7 @@ fn render_variant_after_name(
                 }
                 write!(f, " }}")?;
             } else {
-                let mut it = it.map(|x| x.0);
+                let mut it = it.map(|it| it.0);
                 write!(f, "(")?;
                 if let Some(id) = it.next() {
                     render_field(f, id)?;
@@ -1223,7 +1241,8 @@ fn hir_fmt_generics(
     generic_def: Option<hir_def::GenericDefId>,
 ) -> Result<(), HirDisplayError> {
     let db = f.db;
-    if parameters.len(Interner) > 0 {
+    let lifetime_args_count = generic_def.map_or(0, |g| db.generic_params(g).lifetimes.len());
+    if parameters.len(Interner) + lifetime_args_count > 0 {
         let parameters_to_write = if f.display_target.is_source_code() || f.omit_verbose_types() {
             match generic_def
                 .map(|generic_def_id| db.generic_defaults(generic_def_id))
@@ -1237,19 +1256,20 @@ fn hir_fmt_generics(
                         i: usize,
                         parameters: &Substitution,
                     ) -> bool {
-                        if parameter.ty(Interner).map(|x| x.kind(Interner)) == Some(&TyKind::Error)
+                        if parameter.ty(Interner).map(|it| it.kind(Interner))
+                            == Some(&TyKind::Error)
                         {
                             return true;
                         }
                         if let Some(ConstValue::Concrete(c)) =
-                            parameter.constant(Interner).map(|x| &x.data(Interner).value)
+                            parameter.constant(Interner).map(|it| &it.data(Interner).value)
                         {
                             if c.interned == ConstScalar::Unknown {
                                 return true;
                             }
                         }
                         let default_parameter = match default_parameters.get(i) {
-                            Some(x) => x,
+                            Some(it) => it,
                             None => return true,
                         };
                         let actual_default =
@@ -1268,26 +1288,28 @@ fn hir_fmt_generics(
         } else {
             parameters.as_slice(Interner)
         };
-        if !parameters_to_write.is_empty() {
+        if !parameters_to_write.is_empty() || lifetime_args_count != 0 {
             write!(f, "<")?;
-
-            if f.display_target.is_source_code() {
-                let mut first = true;
-                for generic_arg in parameters_to_write {
-                    if !first {
-                        write!(f, ", ")?;
-                    }
-                    first = false;
-
-                    if generic_arg.ty(Interner).map(|ty| ty.kind(Interner)) == Some(&TyKind::Error)
-                    {
-                        write!(f, "_")?;
-                    } else {
-                        generic_arg.hir_fmt(f)?;
-                    }
+            let mut first = true;
+            for _ in 0..lifetime_args_count {
+                if !first {
+                    write!(f, ", ")?;
                 }
-            } else {
-                f.write_joined(parameters_to_write, ", ")?;
+                first = false;
+                write!(f, "'_")?;
+            }
+            for generic_arg in parameters_to_write {
+                if !first {
+                    write!(f, ", ")?;
+                }
+                first = false;
+                if f.display_target.is_source_code()
+                    && generic_arg.ty(Interner).map(|ty| ty.kind(Interner)) == Some(&TyKind::Error)
+                {
+                    write!(f, "_")?;
+                } else {
+                    generic_arg.hir_fmt(f)?;
+                }
             }
 
             write!(f, ">")?;

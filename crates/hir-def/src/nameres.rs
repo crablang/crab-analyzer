@@ -60,7 +60,7 @@ mod tests;
 use std::{cmp::Ord, ops::Deref};
 
 use base_db::{CrateId, Edition, FileId, ProcMacroKind};
-use hir_expand::{name::Name, InFile, MacroCallId, MacroDefId};
+use hir_expand::{name::Name, HirFileId, InFile, MacroCallId, MacroDefId};
 use itertools::Itertools;
 use la_arena::Arena;
 use profile::Count;
@@ -77,8 +77,8 @@ use crate::{
     path::ModPath,
     per_ns::PerNs,
     visibility::Visibility,
-    AstId, BlockId, BlockLoc, FunctionId, LocalModuleId, Lookup, MacroExpander, MacroId, ModuleId,
-    ProcMacroId,
+    AstId, BlockId, BlockLoc, CrateRootModuleId, FunctionId, LocalModuleId, Lookup, MacroExpander,
+    MacroId, ModuleId, ProcMacroId,
 };
 
 /// Contains the results of (early) name resolution.
@@ -93,7 +93,10 @@ use crate::{
 #[derive(Debug, PartialEq, Eq)]
 pub struct DefMap {
     _c: Count<Self>,
+    /// When this is a block def map, this will hold the block id of the the block and module that
+    /// contains this block.
     block: Option<BlockInfo>,
+    /// The modules and their data declared in this crate.
     modules: Arena<ModuleData>,
     krate: CrateId,
     /// The prelude module for this crate. This either comes from an import
@@ -111,15 +114,18 @@ pub struct DefMap {
     /// attributes.
     derive_helpers_in_scope: FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, MacroCallId)>>,
 
+    /// The diagnostics that need to be emitted for this crate.
     diagnostics: Vec<DefDiagnostic>,
 
+    /// The crate data that is shared between a crate's def map and all its block def maps.
     data: Arc<DefMapCrateData>,
 }
 
 /// Data that belongs to a crate which is shared between a crate's def map and all its block def maps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DefMapCrateData {
-    extern_prelude: FxHashMap<Name, ModuleId>,
+    /// The extern prelude which contains all root modules of external crates that are in scope.
+    extern_prelude: FxHashMap<Name, CrateRootModuleId>,
 
     /// Side table for resolving derive helpers.
     exported_derives: FxHashMap<MacroDefId, Box<[Name]>>,
@@ -189,6 +195,10 @@ impl BlockRelativeModuleId {
 
     fn into_module(self, krate: CrateId) -> ModuleId {
         ModuleId { krate, block: self.block, local_id: self.local_id }
+    }
+
+    fn is_block_module(self) -> bool {
+        self.block.is_some() && self.local_id == DefMap::ROOT
     }
 }
 
@@ -272,13 +282,16 @@ pub struct ModuleData {
     pub origin: ModuleOrigin,
     /// Declared visibility of this module.
     pub visibility: Visibility,
-    /// Always [`None`] for block modules
+    /// Parent module in the same `DefMap`.
+    ///
+    /// [`None`] for block modules because they are always its `DefMap`'s root.
     pub parent: Option<LocalModuleId>,
     pub children: FxHashMap<Name, LocalModuleId>,
     pub scope: ItemScope,
 }
 
 impl DefMap {
+    /// The module id of a crate or block root.
     pub const ROOT: LocalModuleId = LocalModuleId::from_raw(la_arena::RawIdx::from_u32(0));
 
     pub(crate) fn crate_def_map_query(db: &dyn DefDatabase, krate: CrateId) -> Arc<DefMap> {
@@ -419,11 +432,11 @@ impl DefMap {
     }
 
     pub(crate) fn extern_prelude(&self) -> impl Iterator<Item = (&Name, ModuleId)> + '_ {
-        self.data.extern_prelude.iter().map(|(name, def)| (name, *def))
+        self.data.extern_prelude.iter().map(|(name, &def)| (name, def.into()))
     }
 
     pub(crate) fn macro_use_prelude(&self) -> impl Iterator<Item = (&Name, MacroId)> + '_ {
-        self.macro_use_prelude.iter().map(|(name, def)| (name, *def))
+        self.macro_use_prelude.iter().map(|(name, &def)| (name, def))
     }
 
     pub fn module_id(&self, local_id: LocalModuleId) -> ModuleId {
@@ -431,8 +444,8 @@ impl DefMap {
         ModuleId { krate: self.krate, local_id, block }
     }
 
-    pub(crate) fn crate_root(&self) -> ModuleId {
-        ModuleId { krate: self.krate, block: None, local_id: DefMap::ROOT }
+    pub fn crate_root(&self) -> CrateRootModuleId {
+        CrateRootModuleId { krate: self.krate }
     }
 
     pub(crate) fn resolve_path(
@@ -476,7 +489,7 @@ impl DefMap {
     ///
     /// If `f` returns `Some(val)`, iteration is stopped and `Some(val)` is returned. If `f` returns
     /// `None`, iteration continues.
-    pub fn with_ancestor_maps<T>(
+    pub(crate) fn with_ancestor_maps<T>(
         &self,
         db: &dyn DefDatabase,
         local_mod: LocalModuleId,
@@ -617,6 +630,17 @@ impl ModuleData {
     /// Returns a node which defines this module. That is, a file or a `mod foo {}` with items.
     pub fn definition_source(&self, db: &dyn DefDatabase) -> InFile<ModuleSource> {
         self.origin.definition_source(db)
+    }
+
+    /// Same as [`definition_source`] but only returns the file id to prevent parsing the ASt.
+    pub fn definition_source_file_id(&self) -> HirFileId {
+        match self.origin {
+            ModuleOrigin::File { definition, .. } | ModuleOrigin::CrateRoot { definition } => {
+                definition.into()
+            }
+            ModuleOrigin::Inline { definition, .. } => definition.file_id,
+            ModuleOrigin::BlockExpr { block } => block.file_id,
+        }
     }
 
     /// Returns a node which declares this module, either a `mod foo;` or a `mod foo {}`.

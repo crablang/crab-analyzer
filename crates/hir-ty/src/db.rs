@@ -110,6 +110,14 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     #[salsa::invoke(crate::layout::target_data_layout_query)]
     fn target_data_layout(&self, krate: CrateId) -> Option<Arc<TargetDataLayout>>;
 
+    #[salsa::invoke(crate::method_resolution::lookup_impl_method_query)]
+    fn lookup_impl_method(
+        &self,
+        env: Arc<crate::TraitEnvironment>,
+        func: FunctionId,
+        fn_subst: Substitution,
+    ) -> (FunctionId, Substitution);
+
     #[salsa::invoke(crate::lower::callable_item_sig)]
     fn callable_item_signature(&self, def: CallableDefId) -> PolyFnSig;
 
@@ -278,6 +286,7 @@ fn infer_wait(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<InferenceResult> 
         DefWithBodyId::VariantId(it) => {
             db.enum_data(it.parent).variants[it.local_id].name.display(db.upcast()).to_string()
         }
+        DefWithBodyId::InTypeConstId(it) => format!("in type const {it:?}"),
     });
     db.infer_query(def)
 }

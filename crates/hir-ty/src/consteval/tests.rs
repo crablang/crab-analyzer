@@ -16,7 +16,7 @@ mod intrinsics;
 
 fn simplify(e: ConstEvalError) -> ConstEvalError {
     match e {
-        ConstEvalError::MirEvalError(MirEvalError::InFunction(_, e, _, _)) => {
+        ConstEvalError::MirEvalError(MirEvalError::InFunction(e, _)) => {
             simplify(ConstEvalError::MirEvalError(*e))
         }
         _ => e,
@@ -36,6 +36,18 @@ fn check_fail(ra_fixture: &str, error: impl FnOnce(ConstEvalError) -> bool) {
 
 #[track_caller]
 fn check_number(ra_fixture: &str, answer: i128) {
+    check_answer(ra_fixture, |b| {
+        assert_eq!(
+            b,
+            &answer.to_le_bytes()[0..b.len()],
+            "Bytes differ. In decimal form: actual = {}, expected = {answer}",
+            i128::from_le_bytes(pad16(b, true))
+        );
+    });
+}
+
+#[track_caller]
+fn check_answer(ra_fixture: &str, check: impl FnOnce(&[u8])) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
     let r = match eval_goal(&db, file_id) {
         Ok(t) => t,
@@ -47,12 +59,7 @@ fn check_number(ra_fixture: &str, answer: i128) {
     match &r.data(Interner).value {
         chalk_ir::ConstValue::Concrete(c) => match &c.interned {
             ConstScalar::Bytes(b, _) => {
-                assert_eq!(
-                    b,
-                    &answer.to_le_bytes()[0..b.len()],
-                    "Bytes differ. In decimal form: actual = {}, expected = {answer}",
-                    i128::from_le_bytes(pad16(b, true))
-                );
+                check(b);
             }
             x => panic!("Expected number but found {:?}", x),
         },
@@ -87,7 +94,7 @@ fn eval_goal(db: &TestDB, file_id: FileId) -> Result<Const, ConstEvalError> {
             }
             _ => None,
         })
-        .unwrap();
+        .expect("No const named GOAL found in the test");
     db.const_eval(const_id.into(), Substitution::empty(Interner))
 }
 
@@ -108,6 +115,7 @@ fn bit_op() {
     check_fail(r#"const GOAL: i8 = 1 << 8"#, |e| {
         e == ConstEvalError::MirEvalError(MirEvalError::Panic("Overflow in Shl".to_string()))
     });
+    check_number(r#"const GOAL: i32 = 100000000i32 << 11"#, (100000000i32 << 11) as i128);
 }
 
 #[test]
@@ -166,14 +174,21 @@ fn casts() {
     check_number(
         r#"
     //- minicore: coerce_unsized, index, slice
+    struct X {
+        unsize_field: [u8],
+    }
+
     const GOAL: usize = {
         let a = [10, 20, 3, 15];
         let x: &[i32] = &a;
-        let y: *const [i32] = x;
-        let z = y as *const [u8]; // slice fat pointer cast don't touch metadata
-        let q = z as *const str;
-        let p = q as *const [u8];
-        let w = unsafe { &*z };
+        let x: *const [i32] = x;
+        let x = x as *const [u8]; // slice fat pointer cast don't touch metadata
+        let x = x as *const str;
+        let x = x as *const X;
+        let x = x as *const [i16];
+        let x = x as *const X;
+        let x = x as *const [u8];
+        let w = unsafe { &*x };
         w.len()
     };
         "#,
@@ -195,6 +210,30 @@ fn raw_pointer_equality() {
         };
         "#,
         1,
+    );
+}
+
+#[test]
+fn alignment() {
+    check_answer(
+        r#"
+//- minicore: transmute
+use core::mem::transmute;
+const GOAL: usize = {
+    let x: i64 = 2;
+    transmute(&x)
+}
+        "#,
+        |b| assert_eq!(b[0] % 8, 0),
+    );
+    check_answer(
+        r#"
+//- minicore: transmute
+use core::mem::transmute;
+static X: i64 = 12;
+const GOAL: usize = transmute(&X);
+        "#,
+        |b| assert_eq!(b[0] % 8, 0),
     );
 }
 
@@ -1551,6 +1590,30 @@ fn closures() {
 }
 
 #[test]
+fn manual_fn_trait_impl() {
+    check_number(
+        r#"
+//- minicore: fn, copy
+struct S(i32);
+
+impl FnOnce<(i32, i32)> for S {
+    type Output = i32;
+
+    extern "rust-call" fn call_once(self, arg: (i32, i32)) -> i32 {
+        arg.0 + arg.1 + self.0
+    }
+}
+
+const GOAL: i32 = {
+    let s = S(1);
+    s(2, 3)
+};
+"#,
+        6,
+    );
+}
+
+#[test]
 fn closure_and_impl_fn() {
     check_number(
         r#"
@@ -1850,6 +1913,38 @@ fn dyn_trait() {
 }
 
 #[test]
+fn coerce_unsized() {
+    check_number(
+        r#"
+//- minicore: coerce_unsized, deref_mut, slice, index, transmute, non_null
+use core::ops::{Deref, DerefMut, CoerceUnsized};
+use core::{marker::Unsize, mem::transmute, ptr::NonNull};
+
+struct ArcInner<T: ?Sized> {
+    strong: usize,
+    weak: usize,
+    data: T,
+}
+
+pub struct Arc<T: ?Sized> {
+    inner: NonNull<ArcInner<T>>,
+}
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Arc<U>> for Arc<T> {}
+
+const GOAL: usize = {
+    let x = transmute::<usize, Arc<[i32; 3]>>(12);
+    let y: Arc<[i32]> = x;
+    let z = transmute::<Arc<[i32]>, (usize, usize)>(y);
+    z.1
+};
+
+        "#,
+        3,
+    );
+}
+
+#[test]
 fn boxes() {
     check_number(
         r#"
@@ -2018,6 +2113,57 @@ fn consts() {
     "#,
         6,
     );
+
+    check_number(
+        r#"
+    const F1: i32 = 2147483647;
+    const F2: i32 = F1 - 25;
+    const GOAL: i32 = F2;
+    "#,
+        2147483622,
+    );
+
+    check_number(
+        r#"
+    const F1: i32 = -2147483648;
+    const F2: i32 = F1 + 18;
+    const GOAL: i32 = F2;
+    "#,
+        -2147483630,
+    );
+
+    check_number(
+        r#"
+    const F1: i32 = 10;
+    const F2: i32 = F1 - 20;
+    const GOAL: i32 = F2;
+    "#,
+        -10,
+    );
+
+    check_number(
+        r#"
+    const F1: i32 = 25;
+    const F2: i32 = F1 - 25;
+    const GOAL: i32 = F2;
+    "#,
+        0,
+    );
+
+    check_number(
+        r#"
+    const A: i32 = -2147483648;
+    const GOAL: bool = A > 0;
+    "#,
+        0,
+    );
+
+    check_number(
+        r#"
+    const GOAL: i64 = (-2147483648_i32) as i64;
+    "#,
+        -2147483648,
+    );
 }
 
 #[test]
@@ -2048,6 +2194,17 @@ fn extern_weak_statics() {
     const GOAL: usize = __dso_handle as usize;
     "#,
         0,
+    );
+}
+
+#[test]
+fn from_ne_bytes() {
+    check_number(
+        r#"
+//- minicore: int_impl
+const GOAL: u32 = u32::from_ne_bytes([44, 1, 0, 0]);
+        "#,
+        300,
     );
 }
 
@@ -2300,20 +2457,6 @@ fn const_trait_assoc() {
 }
 
 #[test]
-fn panic_messages() {
-    check_fail(
-        r#"
-    //- minicore: panic
-    const GOAL: u8 = {
-        let x: u16 = 2;
-        panic!("hello");
-    };
-    "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::Panic("hello".to_string())),
-    );
-}
-
-#[test]
 fn exec_limits() {
     check_fail(
         r#"
@@ -2328,7 +2471,7 @@ fn exec_limits() {
     }
     const GOAL: i32 = f(0);
     "#,
-        |e| e == ConstEvalError::MirEvalError(MirEvalError::StackOverflow),
+        |e| e == ConstEvalError::MirEvalError(MirEvalError::ExecutionLimitExceeded),
     );
     // Reasonable code should still work
     check_number(
@@ -2362,6 +2505,37 @@ fn type_error() {
     };
     "#,
         |e| matches!(e, ConstEvalError::MirLowerError(MirLowerError::TypeMismatch(_))),
+    );
+}
+
+#[test]
+fn unsized_field() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice, transmute
+    use core::mem::transmute;
+
+    struct Slice([u8]);
+    struct Slice2(Slice);
+
+    impl Slice2 {
+        fn as_inner(&self) -> &Slice {
+            &self.0
+        }
+
+        fn as_bytes(&self) -> &[u8] {
+            &self.as_inner().0
+        }
+    }
+
+    const GOAL: u8 = unsafe {
+        let x: &[u8] = &[1, 2, 3];
+        let x: &Slice2 = transmute(x);
+        let x = x.as_bytes();
+        x[0] + x[1] + x[2]
+    };
+        "#,
+        6,
     );
 }
 

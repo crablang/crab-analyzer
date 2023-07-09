@@ -149,10 +149,8 @@ impl SearchScope {
 
         let mut to_visit: Vec<_> = module.children(db).collect();
         while let Some(module) = to_visit.pop() {
-            if let InFile { file_id, value: ModuleSource::SourceFile(_) } =
-                module.definition_source(db)
-            {
-                entries.insert(file_id.original_file(db), None);
+            if let Some(file_id) = module.as_source_file_id(db) {
+                entries.insert(file_id, None);
             }
             to_visit.extend(module.children(db));
         }
@@ -243,6 +241,8 @@ impl Definition {
                 DefWithBody::Const(c) => c.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Static(s) => s.source(db).map(|src| src.syntax().cloned()),
                 DefWithBody::Variant(v) => v.source(db).map(|src| src.syntax().cloned()),
+                // FIXME: implement
+                DefWithBody::InTypeConst(_) => return SearchScope::empty(),
             };
             return match def {
                 Some(def) => SearchScope::file_range(def.as_ref().original_file_range_full(db)),
@@ -338,21 +338,21 @@ pub struct FindUsages<'a> {
     search_self_mod: bool,
 }
 
-impl<'a> FindUsages<'a> {
+impl FindUsages<'_> {
     /// Enable searching for `Self` when the definition is a type or `self` for modules.
-    pub fn include_self_refs(mut self) -> FindUsages<'a> {
+    pub fn include_self_refs(mut self) -> Self {
         self.include_self_kw_refs = def_to_ty(self.sema, &self.def);
         self.search_self_mod = true;
         self
     }
 
     /// Limit the search to a given [`SearchScope`].
-    pub fn in_scope(self, scope: SearchScope) -> FindUsages<'a> {
+    pub fn in_scope(self, scope: SearchScope) -> Self {
         self.set_scope(Some(scope))
     }
 
     /// Limit the search to a given [`SearchScope`].
-    pub fn set_scope(mut self, scope: Option<SearchScope>) -> FindUsages<'a> {
+    pub fn set_scope(mut self, scope: Option<SearchScope>) -> Self {
         assert!(self.scope.is_none());
         self.scope = scope;
         self

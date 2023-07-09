@@ -166,7 +166,7 @@ pub fn ty_alias(
     assignment: Option<(ast::Type, Option<ast::WhereClause>)>,
 ) -> ast::TypeAlias {
     let mut s = String::new();
-    s.push_str(&format!("type {} ", ident));
+    s.push_str(&format!("type {}", ident));
 
     if let Some(list) = generic_param_list {
         s.push_str(&list.to_string());
@@ -182,9 +182,9 @@ pub fn ty_alias(
 
     if let Some(exp) = assignment {
         if let Some(cl) = exp.1 {
-            s.push_str(&format!("= {} {}", &exp.0.to_string(), &cl.to_string()));
+            s.push_str(&format!(" = {} {}", &exp.0.to_string(), &cl.to_string()));
         } else {
-            s.push_str(&format!("= {}", &exp.0.to_string()));
+            s.push_str(&format!(" = {}", &exp.0.to_string()));
         }
     }
 
@@ -445,6 +445,21 @@ pub fn block_expr(
     }
     buf += "}";
     ast_from_text(&format!("fn f() {buf}"))
+}
+
+pub fn async_move_block_expr(
+    stmts: impl IntoIterator<Item = ast::Stmt>,
+    tail_expr: Option<ast::Expr>,
+) -> ast::BlockExpr {
+    let mut buf = "async move {\n".to_string();
+    for stmt in stmts.into_iter() {
+        format_to!(buf, "    {stmt}\n");
+    }
+    if let Some(tail_expr) = tail_expr {
+        format_to!(buf, "    {tail_expr}\n");
+    }
+    buf += "}";
+    ast_from_text(&format!("const _: () = {buf};"))
 }
 
 pub fn tail_only_block_expr(tail_expr: ast::Expr) -> ast::BlockExpr {
@@ -848,6 +863,36 @@ pub fn param_list(
     ast_from_text(&list)
 }
 
+pub fn trait_(
+    is_unsafe: bool,
+    ident: &str,
+    gen_params: Option<ast::GenericParamList>,
+    where_clause: Option<ast::WhereClause>,
+    assoc_items: ast::AssocItemList,
+) -> ast::Trait {
+    let mut text = String::new();
+
+    if is_unsafe {
+        format_to!(text, "unsafe ");
+    }
+
+    format_to!(text, "trait {ident}");
+
+    if let Some(gen_params) = gen_params {
+        format_to!(text, "{} ", gen_params.to_string());
+    } else {
+        text.push(' ');
+    }
+
+    if let Some(where_clause) = where_clause {
+        format_to!(text, "{} ", where_clause.to_string());
+    }
+
+    format_to!(text, "{}", assoc_items.to_string());
+
+    ast_from_text(&text)
+}
+
 pub fn type_bound(bound: &str) -> ast::TypeBound {
     ast_from_text(&format!("fn f<T: {bound}>() {{ }}"))
 }
@@ -1021,6 +1066,17 @@ pub mod tokens {
             "const C: <()>::Item = (1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p)\n;\n\n",
         )
     });
+
+    pub fn semicolon() -> SyntaxToken {
+        SOURCE_FILE
+            .tree()
+            .syntax()
+            .clone_for_update()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|it| it.kind() == SEMICOLON)
+            .unwrap()
+    }
 
     pub fn single_space() -> SyntaxToken {
         SOURCE_FILE

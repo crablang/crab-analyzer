@@ -896,13 +896,13 @@ fn flush(&self) {
 "#,
         expect![[r#"
             123..127 'self': &Mutex<T>
-            150..152 '{}': MutexGuard<T>
+            150..152 '{}': MutexGuard<'_, T>
             234..238 'self': &{unknown}
             240..290 '{     ...()); }': ()
             250..251 'w': &Mutex<BufWriter>
             276..287 '*(w.lock())': BufWriter
             278..279 'w': &Mutex<BufWriter>
-            278..286 'w.lock()': MutexGuard<BufWriter>
+            278..286 'w.lock()': MutexGuard<'_, BufWriter>
         "#]],
     );
 }
@@ -1240,11 +1240,11 @@ fn test() {
             16..66 'for _ ...     }': IntoIterator::IntoIter<()>
             16..66 'for _ ...     }': &mut IntoIterator::IntoIter<()>
             16..66 'for _ ...     }': fn next<IntoIterator::IntoIter<()>>(&mut IntoIterator::IntoIter<()>) -> Option<<IntoIterator::IntoIter<()> as Iterator>::Item>
-            16..66 'for _ ...     }': Option<Iterator::Item<IntoIterator::IntoIter<()>>>
+            16..66 'for _ ...     }': Option<IntoIterator::Item<()>>
             16..66 'for _ ...     }': ()
             16..66 'for _ ...     }': ()
             16..66 'for _ ...     }': ()
-            20..21 '_': Iterator::Item<IntoIterator::IntoIter<()>>
+            20..21 '_': IntoIterator::Item<()>
             25..39 '{ let x = 0; }': ()
             31..32 'x': i32
             35..36 '0': i32
@@ -1951,6 +1951,29 @@ impl Inner<1> {
     {
         func(self)
     }
+}
+        "#,
+    );
+}
+
+#[test]
+fn dont_crash_on_slice_unsizing() {
+    check_no_mismatches(
+        r#"
+//- minicore: slice, unsize, coerce_unsized
+trait Tr {
+    fn f(self);
+}
+
+impl Tr for [i32] {
+    fn f(self) {
+        let t;
+        x(t);
+    }
+}
+
+fn x(a: [i32; 4]) {
+    let b = a.f();
 }
         "#,
     );

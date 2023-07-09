@@ -674,7 +674,7 @@ struct Foo { fiel$0d_a: u8, field_b: i32, field_c: i16 }
             ```
 
             ```rust
-            field_a: u8 // size = 1, align = 1, offset = 4
+            field_a: u8 // size = 1, align = 1, offset = 6
             ```
         "#]],
     );
@@ -776,6 +776,39 @@ const foo$0: u32 = {
 
             ```rust
             static foo: u32 = 456
+            ```
+        "#]],
+    );
+
+    check(
+        r#"const FOO$0: i32 = -2147483648;"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: i32 = -2147483648 (0x80000000)
+            ```
+        "#]],
+    );
+
+    check(
+        r#"
+        const FOO: i32 = -2147483648;
+        const BAR$0: bool = FOO > 0;
+        "#,
+        expect![[r#"
+            *BAR*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const BAR: bool = false
             ```
         "#]],
     );
@@ -4423,6 +4456,29 @@ const FOO$0: Option<&i32> = Some(2).as_ref();
 }
 
 #[test]
+fn hover_const_eval_dyn_trait() {
+    check(
+        r#"
+//- minicore: fmt, coerce_unsized, builtin_impls
+use core::fmt::Debug;
+
+const FOO$0: &dyn Debug = &2i32;
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: &dyn Debug = &2
+            ```
+        "#]],
+    );
+}
+
+#[test]
 fn hover_const_eval_slice() {
     check(
         r#"
@@ -4499,6 +4555,26 @@ const FOO$0: Tree = {
 
             ```rust
             const FOO: Tree = Tree(&[Tree(&[Tree(&[]), Tree(&[Tree(&[])])]), Tree(&[Tree(&[]), Tree(&[Tree(&[])])])])
+            ```
+        "#]],
+    );
+    // FIXME: Show the data of unsized structs
+    check(
+        r#"
+//- minicore: slice, index, coerce_unsized, transmute
+#[repr(transparent)]
+struct S<T: ?Sized>(T);
+const FOO$0: &S<[u8]> = core::mem::transmute::<&[u8], _>(&[1, 2, 3]);
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: &S<[u8]> = &S
             ```
         "#]],
     );

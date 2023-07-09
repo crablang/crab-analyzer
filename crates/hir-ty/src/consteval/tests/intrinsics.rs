@@ -15,6 +15,141 @@ fn size_of() {
 }
 
 #[test]
+fn size_of_val() {
+    check_number(
+        r#"
+        //- minicore: coerce_unsized
+        extern "rust-intrinsic" {
+            pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        struct X(i32, u8);
+
+        const GOAL: usize = size_of_val(&X(1, 2));
+        "#,
+        8,
+    );
+    check_number(
+        r#"
+        //- minicore: coerce_unsized
+        extern "rust-intrinsic" {
+            pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        const GOAL: usize = {
+            let it: &[i32] = &[1, 2, 3];
+            size_of_val(it)
+        };
+        "#,
+        12,
+    );
+    check_number(
+        r#"
+        //- minicore: coerce_unsized, transmute
+        use core::mem::transmute;
+
+        extern "rust-intrinsic" {
+            pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        struct X {
+            x: i64,
+            y: u8,
+            t: [i32],
+        }
+
+        const GOAL: usize = unsafe {
+            let y: &X = transmute([0usize, 3]);
+            size_of_val(y)
+        };
+        "#,
+        24,
+    );
+    check_number(
+        r#"
+        //- minicore: coerce_unsized, transmute
+        use core::mem::transmute;
+
+        extern "rust-intrinsic" {
+            pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        struct X {
+            x: i32,
+            y: i64,
+            t: [u8],
+        }
+
+        const GOAL: usize = unsafe {
+            let y: &X = transmute([0usize, 15]);
+            size_of_val(y)
+        };
+    "#,
+        32,
+    );
+    check_number(
+        r#"
+        //- minicore: coerce_unsized, fmt, builtin_impls
+        extern "rust-intrinsic" {
+            pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        const GOAL: usize = {
+            let x: &i16 = &5;
+            let y: &dyn core::fmt::Debug = x;
+            let z: &dyn core::fmt::Debug = &y;
+            size_of_val(x) + size_of_val(y) * 10 + size_of_val(z) * 100
+        };
+        "#,
+        1622,
+    );
+    check_number(
+        r#"
+        //- minicore: coerce_unsized
+        extern "rust-intrinsic" {
+            pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        const GOAL: usize = {
+            size_of_val("salam")
+        };
+        "#,
+        5,
+    );
+}
+
+#[test]
+fn min_align_of_val() {
+    check_number(
+        r#"
+        //- minicore: coerce_unsized
+        extern "rust-intrinsic" {
+            pub fn min_align_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        struct X(i32, u8);
+
+        const GOAL: usize = min_align_of_val(&X(1, 2));
+        "#,
+        4,
+    );
+    check_number(
+        r#"
+        //- minicore: coerce_unsized
+        extern "rust-intrinsic" {
+            pub fn min_align_of_val<T: ?Sized>(_: *const T) -> usize;
+        }
+
+        const GOAL: usize = {
+            let x: &[i32] = &[1, 2, 3];
+            min_align_of_val(x)
+        };
+        "#,
+        4,
+    );
+}
+
+#[test]
 fn transmute() {
     check_number(
         r#"
@@ -32,6 +167,7 @@ fn transmute() {
 fn const_eval_select() {
     check_number(
         r#"
+        //- minicore: fn
         extern "rust-intrinsic" {
             pub fn const_eval_select<ARG, F, G, RET>(arg: ARG, called_in_const: F, called_at_rt: G) -> RET
             where
@@ -68,7 +204,7 @@ fn wrapping_add() {
 }
 
 #[test]
-fn saturating_add() {
+fn saturating() {
     check_number(
         r#"
         extern "rust-intrinsic" {
@@ -78,6 +214,16 @@ fn saturating_add() {
         const GOAL: u8 = saturating_add(10, 250);
         "#,
         255,
+    );
+    check_number(
+        r#"
+        extern "rust-intrinsic" {
+            pub fn saturating_sub<T>(a: T, b: T) -> T;
+        }
+
+        const GOAL: bool = saturating_sub(5u8, 7) == 0 && saturating_sub(8u8, 4) == 4;
+        "#,
+        1,
     );
     check_number(
         r#"
@@ -112,6 +258,7 @@ fn allocator() {
             *ptr = 23;
             *ptr2 = 32;
             let ptr = __rust_realloc(ptr, 4, 1, 8);
+            let ptr = __rust_realloc(ptr, 8, 1, 3);
             let ptr2 = ((ptr as usize) + 1) as *mut u8;
             *ptr + *ptr2
         };
@@ -154,6 +301,24 @@ fn needs_drop() {
         }
         struct X;
         const GOAL: bool = !needs_drop::<i32>() && needs_drop::<X>();
+        "#,
+        1,
+    );
+}
+
+#[test]
+fn discriminant_value() {
+    check_number(
+        r#"
+        //- minicore: discriminant, option
+        use core::marker::DiscriminantKind;
+        extern "rust-intrinsic" {
+            pub fn discriminant_value<T>(v: &T) -> <T as DiscriminantKind>::Discriminant;
+        }
+        const GOAL: bool = {
+            discriminant_value(&Some(2i32)) == discriminant_value(&Some(5i32))
+                && discriminant_value(&Some(2i32)) != discriminant_value(&None::<i32>)
+        };
         "#,
         1,
     );
@@ -373,5 +538,49 @@ fn cttz() {
         const GOAL: i64 = cttz(-24);
         "#,
         3,
+    );
+}
+
+#[test]
+fn rotate() {
+    check_number(
+        r#"
+        extern "rust-intrinsic" {
+            pub fn rotate_left<T: Copy>(x: T, y: T) -> T;
+        }
+
+        const GOAL: i64 = rotate_left(0xaa00000000006e1i64, 12);
+        "#,
+        0x6e10aa,
+    );
+    check_number(
+        r#"
+        extern "rust-intrinsic" {
+            pub fn rotate_right<T: Copy>(x: T, y: T) -> T;
+        }
+
+        const GOAL: i64 = rotate_right(0x6e10aa, 12);
+        "#,
+        0xaa00000000006e1,
+    );
+    check_number(
+        r#"
+        extern "rust-intrinsic" {
+            pub fn rotate_left<T: Copy>(x: T, y: T) -> T;
+        }
+
+        const GOAL: i8 = rotate_left(129, 2);
+        "#,
+        6,
+    );
+    check_number(
+        r#"
+        extern "rust-intrinsic" {
+            pub fn rotate_right<T: Copy>(x: T, y: T) -> T;
+        }
+
+        const GOAL: i32 = rotate_right(10006016, 1020315);
+        "#,
+        320192512,
     );
 }

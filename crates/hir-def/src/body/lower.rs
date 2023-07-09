@@ -11,7 +11,6 @@ use hir_expand::{
     AstId, ExpandError, InFile,
 };
 use intern::Interned;
-use la_arena::Arena;
 use profile::Count;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -40,7 +39,7 @@ use crate::{
     nameres::{DefMap, MacroSubNs},
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
-    AdtId, BlockId, BlockLoc, DefWithBodyId, ModuleDefId, UnresolvedMacro,
+    AdtId, BlockId, BlockLoc, ConstBlockLoc, DefWithBodyId, ModuleDefId, UnresolvedMacro,
 };
 
 pub(super) fn lower(
@@ -60,10 +59,11 @@ pub(super) fn lower(
         source_map: BodySourceMap::default(),
         ast_id_map: db.ast_id_map(expander.current_file_id),
         body: Body {
-            exprs: Arena::default(),
-            pats: Arena::default(),
-            bindings: Arena::default(),
-            labels: Arena::default(),
+            exprs: Default::default(),
+            pats: Default::default(),
+            bindings: Default::default(),
+            binding_owners: Default::default(),
+            labels: Default::default(),
             params: Vec::new(),
             body_expr: dummy_expr_id(),
             block_scopes: Vec::new(),
@@ -188,7 +188,7 @@ impl ExprCollector<'_> {
                 param_list.self_param().filter(|_| attr_enabled.next().unwrap_or(false))
             {
                 let ptr = AstPtr::new(&self_param);
-                let binding_id = self.alloc_binding(
+                let binding_id: la_arena::Idx<Binding> = self.alloc_binding(
                     name![self],
                     BindingAnnotation::new(
                         self_param.mut_token().is_some() && self_param.amp_token().is_none(),
@@ -297,8 +297,11 @@ impl ExprCollector<'_> {
                         let (result_expr_id, prev_binding_owner) =
                             this.initialize_binding_owner(syntax_ptr);
                         let inner_expr = this.collect_block(e);
-                        let x = this.db.intern_anonymous_const((this.owner, inner_expr));
-                        this.body.exprs[result_expr_id] = Expr::Const(x);
+                        let it = this.db.intern_anonymous_const(ConstBlockLoc {
+                            parent: this.owner,
+                            root: inner_expr,
+                        });
+                        this.body.exprs[result_expr_id] = Expr::Const(it);
                         this.current_binding_owner = prev_binding_owner;
                         result_expr_id
                     })
@@ -321,10 +324,10 @@ impl ExprCollector<'_> {
             ast::Expr::CallExpr(e) => {
                 let is_rustc_box = {
                     let attrs = e.attrs();
-                    attrs.filter_map(|x| x.as_simple_atom()).any(|x| x == "rustc_box")
+                    attrs.filter_map(|it| it.as_simple_atom()).any(|it| it == "rustc_box")
                 };
                 if is_rustc_box {
-                    let expr = self.collect_expr_opt(e.arg_list().and_then(|x| x.args().next()));
+                    let expr = self.collect_expr_opt(e.arg_list().and_then(|it| it.args().next()));
                     self.alloc_expr(Expr::Box { expr }, syntax_ptr)
                 } else {
                     let callee = self.collect_expr_opt(e.expr());
@@ -742,16 +745,14 @@ impl ExprCollector<'_> {
     /// }
     /// ```
     fn collect_for_loop(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::ForExpr) -> ExprId {
-        let (into_iter_fn, iter_next_fn, option_some, option_none) = 'if_chain: {
-            if let Some(into_iter_fn) = LangItem::IntoIterIntoIter.path(self.db, self.krate) {
-                if let Some(iter_next_fn) = LangItem::IteratorNext.path(self.db, self.krate) {
-                    if let Some(option_some) = LangItem::OptionSome.path(self.db, self.krate) {
-                        if let Some(option_none) = LangItem::OptionNone.path(self.db, self.krate) {
-                            break 'if_chain (into_iter_fn, iter_next_fn, option_some, option_none);
-                        }
-                    }
-                }
-            }
+        let Some((into_iter_fn, iter_next_fn, option_some, option_none)) = (|| {
+            Some((
+                LangItem::IntoIterIntoIter.path(self.db, self.krate)?,
+                LangItem::IteratorNext.path(self.db, self.krate)?,
+                LangItem::OptionSome.path(self.db, self.krate)?,
+                LangItem::OptionNone.path(self.db, self.krate)?,
+            ))
+        })() else {
             // Some of the needed lang items are missing, so we can't desugar
             return self.alloc_expr(Expr::Missing, syntax_ptr);
         };
@@ -780,12 +781,12 @@ impl ExprCollector<'_> {
             pat: self.alloc_pat_desugared(some_pat),
             guard: None,
             expr: self.with_opt_labeled_rib(label, |this| {
-                this.collect_expr_opt(e.loop_body().map(|x| x.into()))
+                this.collect_expr_opt(e.loop_body().map(|it| it.into()))
             }),
         };
         let iter_name = Name::generate_new_name();
-        let iter_binding = self.alloc_binding(iter_name.clone(), BindingAnnotation::Mutable);
-        let iter_expr = self.alloc_expr(Expr::Path(Path::from(iter_name)), syntax_ptr.clone());
+        let iter_expr =
+            self.alloc_expr(Expr::Path(Path::from(iter_name.clone())), syntax_ptr.clone());
         let iter_expr_mut = self.alloc_expr(
             Expr::Ref { expr: iter_expr, rawness: Rawness::Ref, mutability: Mutability::Mut },
             syntax_ptr.clone(),
@@ -805,7 +806,9 @@ impl ExprCollector<'_> {
         );
         let loop_outer =
             self.alloc_expr(Expr::Loop { body: loop_inner, label }, syntax_ptr.clone());
+        let iter_binding = self.alloc_binding(iter_name, BindingAnnotation::Mutable);
         let iter_pat = self.alloc_pat_desugared(Pat::Bind { id: iter_binding, subpat: None });
+        self.add_definition_to_binding(iter_binding, iter_pat);
         self.alloc_expr(
             Expr::Match {
                 expr: iterator,
@@ -827,18 +830,14 @@ impl ExprCollector<'_> {
     /// }
     /// ```
     fn collect_try_operator(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::TryExpr) -> ExprId {
-        let (try_branch, cf_continue, cf_break, try_from_residual) = 'if_chain: {
-            if let Some(try_branch) = LangItem::TryTraitBranch.path(self.db, self.krate) {
-                if let Some(cf_continue) = LangItem::ControlFlowContinue.path(self.db, self.krate) {
-                    if let Some(cf_break) = LangItem::ControlFlowBreak.path(self.db, self.krate) {
-                        if let Some(try_from_residual) =
-                            LangItem::TryTraitFromResidual.path(self.db, self.krate)
-                        {
-                            break 'if_chain (try_branch, cf_continue, cf_break, try_from_residual);
-                        }
-                    }
-                }
-            }
+        let Some((try_branch, cf_continue, cf_break, try_from_residual)) = (|| {
+            Some((
+                LangItem::TryTraitBranch.path(self.db, self.krate)?,
+                LangItem::ControlFlowContinue.path(self.db, self.krate)?,
+                LangItem::ControlFlowBreak.path(self.db, self.krate)?,
+                LangItem::TryTraitFromResidual.path(self.db, self.krate)?,
+            ))
+        })() else {
             // Some of the needed lang items are missing, so we can't desugar
             return self.alloc_expr(Expr::Missing, syntax_ptr);
         };
@@ -875,10 +874,10 @@ impl ExprCollector<'_> {
             }),
             guard: None,
             expr: {
-                let x = self.alloc_expr(Expr::Path(Path::from(break_name)), syntax_ptr.clone());
+                let it = self.alloc_expr(Expr::Path(Path::from(break_name)), syntax_ptr.clone());
                 let callee = self.alloc_expr(Expr::Path(try_from_residual), syntax_ptr.clone());
                 let result = self.alloc_expr(
-                    Expr::Call { callee, args: Box::new([x]), is_assignee_expr: false },
+                    Expr::Call { callee, args: Box::new([it]), is_assignee_expr: false },
                     syntax_ptr.clone(),
                 );
                 self.alloc_expr(
@@ -1241,12 +1240,12 @@ impl ExprCollector<'_> {
                 pats.push(self.collect_pat(first, binding_list));
                 binding_list.reject_new = true;
                 for rest in it {
-                    for (_, x) in binding_list.is_used.iter_mut() {
-                        *x = false;
+                    for (_, it) in binding_list.is_used.iter_mut() {
+                        *it = false;
                     }
                     pats.push(self.collect_pat(rest, binding_list));
-                    for (&id, &x) in binding_list.is_used.iter() {
-                        if !x {
+                    for (&id, &is_used) in binding_list.is_used.iter() {
+                        if !is_used {
                             self.body.bindings[id].problems =
                                 Some(BindingProblems::NotBoundAcrossAll);
                         }
@@ -1353,9 +1352,9 @@ impl ExprCollector<'_> {
             // FIXME: implement in a way that also builds source map and calculates assoc resolutions in type inference.
             ast::Pat::RangePat(p) => {
                 let mut range_part_lower = |p: Option<ast::Pat>| {
-                    p.and_then(|x| match &x {
-                        ast::Pat::LiteralPat(x) => {
-                            Some(Box::new(LiteralOrConst::Literal(pat_literal_to_hir(x)?.0)))
+                    p.and_then(|it| match &it {
+                        ast::Pat::LiteralPat(it) => {
+                            Some(Box::new(LiteralOrConst::Literal(pat_literal_to_hir(it)?.0)))
                         }
                         ast::Pat::IdentPat(p) => {
                             let name =
@@ -1452,9 +1451,7 @@ impl ExprCollector<'_> {
         &self,
         lifetime: Option<ast::Lifetime>,
     ) -> Result<Option<LabelId>, BodyDiagnostic> {
-        let Some(lifetime) = lifetime else {
-            return Ok(None)
-        };
+        let Some(lifetime) = lifetime else { return Ok(None) };
         let name = Name::new_lifetime(&lifetime);
 
         for (rib_idx, rib) in self.label_ribs.iter().enumerate().rev() {
@@ -1541,13 +1538,16 @@ impl ExprCollector<'_> {
     }
 
     fn alloc_binding(&mut self, name: Name, mode: BindingAnnotation) -> BindingId {
-        self.body.bindings.alloc(Binding {
+        let binding = self.body.bindings.alloc(Binding {
             name,
             mode,
             definitions: SmallVec::new(),
-            owner: self.current_binding_owner,
             problems: None,
-        })
+        });
+        if let Some(owner) = self.current_binding_owner {
+            self.body.binding_owners.insert(binding, owner);
+        }
+        binding
     }
 
     fn alloc_pat(&mut self, pat: Pat, ptr: PatPtr) -> PatId {

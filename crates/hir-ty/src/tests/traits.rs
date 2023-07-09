@@ -4149,6 +4149,30 @@ where
 }
 
 #[test]
+fn gats_in_bounds_for_assoc() {
+    check_types(
+        r#"
+trait Trait {
+    type Assoc: Another<Gat<i32> = usize>;
+    type Assoc2<T>: Another<Gat<T> = T>;
+}
+trait Another {
+    type Gat<T>;
+    fn foo(&self) -> Self::Gat<i32>;
+    fn bar<T>(&self) -> Self::Gat<T>;
+}
+
+fn test<T: Trait>(a: T::Assoc, b: T::Assoc2<isize>) {
+    let v = a.foo();
+      //^ usize
+    let v = b.bar::<isize>();
+      //^ isize
+}
+"#,
+    );
+}
+
+#[test]
 fn bin_op_with_scalar_fallback() {
     // Extra impls are significant so that chalk doesn't give us definite guidances.
     check_types(
@@ -4335,8 +4359,9 @@ fn derive_macro_bounds() {
         #[derive(Clone)]
         struct AssocGeneric<T: Tr>(T::Assoc);
 
-        #[derive(Clone)]
-        struct AssocGeneric2<T: Tr>(<T as Tr>::Assoc);
+        // Currently rustc does not accept this.
+        // #[derive(Clone)]
+        // struct AssocGeneric2<T: Tr>(<T as Tr>::Assoc);
 
         #[derive(Clone)]
         struct AssocGeneric3<T: Tr>(Generic<T::Assoc>);
@@ -4361,9 +4386,8 @@ fn derive_macro_bounds() {
             let x: &AssocGeneric<Copy> = &AssocGeneric(NotCopy);
             let x = x.clone();
               //^ &AssocGeneric<Copy>
-            let x: &AssocGeneric2<Copy> = &AssocGeneric2(NotCopy);
-            let x = x.clone();
-              //^ &AssocGeneric2<Copy>
+            // let x: &AssocGeneric2<Copy> = &AssocGeneric2(NotCopy);
+            // let x = x.clone();
             let x: &AssocGeneric3<Copy> = &AssocGeneric3(Generic(NotCopy));
             let x = x.clone();
               //^ &AssocGeneric3<Copy>
